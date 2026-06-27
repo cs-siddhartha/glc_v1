@@ -8,9 +8,16 @@ import os
 import httpx
 
 from glc.voice.tts.base import SynthesizeResult, TTSError, TTSProvider
+from glc.voice.tts.providers.cartesia.schemas import (
+    CARTESIA_ENDPOINT,
+    DEFAULT_MIME,
+    DEFAULT_SAMPLE_RATE,
+    CartesiaTTSRequest,
+    build_headers,
+    resolve_voice_id,
+)
 
-_ENDPOINT = "https://api.cartesia.ai/tts/bytes"
-_DEFAULT_VOICE_ID = "694f9389-aac1-45b6-b726-9d9369183238"
+_CLIENT: httpx.AsyncClient | None = None
 
 
 class Provider(TTSProvider):
@@ -24,8 +31,8 @@ class Provider(TTSProvider):
         if not text:
             return SynthesizeResult(
                 audio_b64="",
-                mime="audio/wav",
-                sample_rate=24000,
+                mime=DEFAULT_MIME,
+                sample_rate=DEFAULT_SAMPLE_RATE,
                 provider=self.name,
                 cost_usd=0.0,
             )
@@ -34,36 +41,25 @@ class Provider(TTSProvider):
         if not api_key:
             raise TTSError("CARTESIA_API_KEY is not set")
 
-        selected_voice_id = voice_id or os.getenv("CARTESIA_VOICE_ID") or _DEFAULT_VOICE_ID
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Cartesia-Version": "2025-04-16",
-            "Content-Type": "application/json",
-        }
-        body = {
-            "model_id": "sonic-2",
-            "transcript": text,
-            "voice": {"mode": "id", "id": selected_voice_id},
-            "output_format": {
-                "container": "wav",
-                "encoding": "pcm_s16le",
-                "sample_rate": 24000,
-            },
-        }
+        selected_voice_id = resolve_voice_id(voice_id, os.getenv("CARTESIA_VOICE_ID"))
+        headers = build_headers(api_key)
+        body = CartesiaTTSRequest(transcript=text, voice_id=selected_voice_id).to_dict()
 
         audio = bytearray()
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                async with client.stream("POST", _ENDPOINT, headers=headers, json=body) as response:
-                    if response.is_error:
-                        error_bytes = await response.aread()
-                        error_message = error_bytes.decode("utf-8", errors="replace").strip()
-                        raise TTSError(
-                            f"Cartesia request failed: {error_message[:500] or response.reason_phrase}",
-                            status=response.status_code,
-                        )
-                    async for chunk in response.aiter_bytes():
-                        audio.extend(chunk)
+            global _CLIENT
+            if _CLIENT is None or _CLIENT.is_closed:
+                _CLIENT = httpx.AsyncClient(timeout=30.0)
+            async with _CLIENT.stream("POST", CARTESIA_ENDPOINT, headers=headers, json=body) as response:
+                if response.is_error:
+                    error_bytes = await response.aread()
+                    error_message = error_bytes.decode("utf-8", errors="replace").strip()
+                    raise TTSError(
+                        f"Cartesia request failed: {error_message[:500] or response.reason_phrase}",
+                        status=response.status_code,
+                    )
+                async for chunk in response.aiter_bytes():
+                    audio.extend(chunk)
         except TTSError:
             raise
         except httpx.TimeoutException as exc:
@@ -76,8 +72,8 @@ class Provider(TTSProvider):
 
         return SynthesizeResult(
             audio_b64=base64.b64encode(audio).decode("ascii"),
-            mime="audio/wav",
-            sample_rate=24000,
+            mime=DEFAULT_MIME,
+            sample_rate=DEFAULT_SAMPLE_RATE,
             provider=self.name,
             cost_usd=0.0,
         )
