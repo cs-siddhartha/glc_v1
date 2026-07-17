@@ -828,10 +828,15 @@ async def list_embedders(request: Request, authorization: str | None = Header(de
 
 
 @router.get("/v1/cost/by_agent")
-async def cost_by_agent(session: str | None = None, agent: str | None = None):
+async def cost_by_agent(
+    session: str | None = None,
+    agent: str | None = None,
+    authorization: str | None = Header(default=None),
+):
+    tenant = require_install_token(authorization)
     from glc import pricing as _pricing
 
-    raw = db.by_agent(session=session)
+    raw = db.by_agent(session=session, tenant=tenant)
     if agent:
         raw = {agent: raw.get(agent, [])}
     out: dict[str, list[dict]] = {}
@@ -911,5 +916,5 @@ async def calls(
     status: str | None = None,
     authorization: str | None = Header(default=None),
 ):
-    require_install_token(authorization)
-    return db.recent(limit=limit, provider=provider, status=status)
+    tenant = require_install_token(authorization)
+    return db.recent(limit=limit, provider=provider, status=status, tenant=tenant)

@@ -6,6 +6,7 @@ tests and CI. The directory is created on import if missing.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 
@@ -56,3 +57,9 @@ def get_or_create_install_token() -> str:
     except OSError:
         pass
     return tok
+
+
+def install_tenant_id() -> str:
+    """Derive a stable tenant scope without storing or exposing the installation token itself."""
+    token = get_or_create_install_token()
+    return hashlib.sha256(token.encode()).hexdigest()

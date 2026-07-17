@@ -15,6 +15,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from glc.config import install_tenant_id
+
 DEFAULT_DIR = Path(os.path.expanduser("~/.glc"))
 DB_PATH = os.getenv("GLC_GATEWAY_DB", str(DEFAULT_DIR / "gateway.sqlite"))
 
@@ -62,14 +64,23 @@ def init() -> None:
                 embed_dim INTEGER,
                 agent TEXT,
                 session TEXT,
-                retries INTEGER DEFAULT 0
+                retries INTEGER DEFAULT 0,
+                tenant TEXT
             )"""
+        )
+        columns = {row["name"] for row in c.execute("PRAGMA table_info(calls)")}
+        if "tenant" not in columns:
+            c.execute("ALTER TABLE calls ADD COLUMN tenant TEXT")
+        c.execute(
+            "UPDATE calls SET tenant=? WHERE tenant IS NULL OR tenant=''",
+            (install_tenant_id(),),
         )
         c.execute("CREATE INDEX IF NOT EXISTS idx_ts ON calls(ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_prov_ts ON calls(provider, ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_role_ts ON calls(call_role, ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_agent_ts ON calls(agent, ts DESC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_session_ts ON calls(session, ts DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_tenant_ts ON calls(tenant, ts DESC)")
 
 
 def log_call(
@@ -95,6 +106,7 @@ def log_call(
     agent=None,
     session=None,
     retries=0,
+    tenant=None,
 ) -> None:
     with conn() as c:
         c.execute(
@@ -103,8 +115,8 @@ def log_call(
                                   latency_ms, status, error, prompt_chars, response_chars,
                                   override, attempted, tool_calls, reasoning_applied, tool_dialect,
                                   call_role, router_decision, embed_dim,
-                                  agent, session, retries)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                  agent, session, retries, tenant)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 time.time(),
                 provider,
@@ -129,17 +141,21 @@ def log_call(
                 agent,
                 session,
                 retries,
+                tenant or install_tenant_id(),
             ),
         )
 
 
-def by_agent(session=None, since=None):
+def by_agent(session=None, since=None, tenant=None):
     where = ["ts >= ?"]
     # Day-rollover fix: bucket by calendar day, not by 24h window.
     args = [since if since is not None else (time.time() - (time.time() % 86400))]
     if session:
         where.append("session=?")
         args.append(session)
+    if tenant:
+        where.append("tenant=?")
+        args.append(tenant)
     q = (
         "SELECT agent, provider, COUNT(*) AS calls, "
         "SUM(input_tokens) AS in_tok, SUM(output_tokens) AS out_tok, "
@@ -158,7 +174,7 @@ def by_agent(session=None, since=None):
         return out
 
 
-def recent(limit=100, provider=None, status=None):
+def recent(limit=100, provider=None, status=None, tenant=None):
     q = "SELECT * FROM calls"
     where, args = [], []
     if provider:
@@ -167,12 +183,18 @@ def recent(limit=100, provider=None, status=None):
     if status:
         where.append("status=?")
         args.append(status)
+    if tenant:
+        where.append("tenant=?")
+        args.append(tenant)
     if where:
         q += " WHERE " + " AND ".join(where)
     q += " ORDER BY ts DESC LIMIT ?"
     args.append(limit)
     with conn() as c:
-        return [dict(r) for r in c.execute(q, args).fetchall()]
+        rows = [dict(r) for r in c.execute(q, args).fetchall()]
+        for row in rows:
+            row.pop("tenant", None)
+        return rows
 
 
 def aggregate(call_role=None):
