@@ -11,11 +11,14 @@ regress them — tests in test_v9_compat.py assert behaviour shape.
 from __future__ import annotations
 
 import asyncio as _asyncio
+import ipaddress
 import json
 import os
+import socket
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 
 import yaml
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -291,15 +294,72 @@ async def _resolve_image_urls(messages):
 
     import httpx as _httpx
 
+    def _host_is_allowlisted(host: str) -> bool:
+        """Match image destinations against explicit exact-host or wildcard entries."""
+        entries = {
+            entry.strip().lower().rstrip(".")
+            for entry in os.getenv("GLC_IMAGE_URL_ALLOWLIST", "").split(",")
+            if entry.strip()
+        }
+        return host in entries or any(
+            entry.startswith("*.") and host.endswith(entry[1:]) and host != entry[2:] for entry in entries
+        )
+
+    async def _validate_destination(url: str) -> None:
+        """Reject non-allowlisted or non-public destinations before each outbound request."""
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError as e:
+            raise HTTPException(400, f"invalid image URL: {e}") from e
+
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise HTTPException(400, "image URL must use http or https")
+        if parsed.username is not None or parsed.password is not None:
+            raise HTTPException(400, "image URL credentials are not allowed")
+        if port not in (80, 443):
+            raise HTTPException(400, "image URL must use port 80 or 443")
+
+        try:
+            host = parsed.hostname.encode("idna").decode("ascii").lower().rstrip(".")
+        except UnicodeError as e:
+            raise HTTPException(400, "image URL hostname is invalid") from e
+        if not _host_is_allowlisted(host):
+            raise HTTPException(400, f"image URL host {host!r} is not allowlisted")
+
+        try:
+            addresses = await _asyncio.get_running_loop().getaddrinfo(
+                host,
+                port,
+                type=socket.SOCK_STREAM,
+            )
+        except socket.gaierror as e:
+            raise HTTPException(400, f"image URL host {host!r} could not be resolved") from e
+
+        resolved_ips = {ipaddress.ip_address(item[4][0].split("%", 1)[0]) for item in addresses}
+        if not resolved_ips or any(not address.is_global for address in resolved_ips):
+            raise HTTPException(400, f"image URL host {host!r} resolves to a non-public address")
+
     async def _fetch_to_data_url(url: str) -> str:
         headers = {
             "User-Agent": "Mozilla/5.0 (compatible; GLCv1/0.1; +image-resolver)",
             "Accept": "image/*,*/*;q=0.8",
         }
-        async with _httpx.AsyncClient(timeout=30, follow_redirects=True, headers=headers) as c:
+        async with _httpx.AsyncClient(timeout=30, follow_redirects=False, headers=headers) as c:
             try:
-                r = await c.get(url)
-                r.raise_for_status()
+                current_url = url
+                for redirect_count in range(6):
+                    await _validate_destination(current_url)
+                    r = await c.get(current_url)
+                    if r.status_code not in (301, 302, 303, 307, 308):
+                        r.raise_for_status()
+                        break
+                    location = r.headers.get("location")
+                    if not location:
+                        raise HTTPException(400, "image URL redirect is missing a destination")
+                    if redirect_count == 5:
+                        raise HTTPException(400, "image URL exceeded the redirect limit")
+                    current_url = urljoin(str(r.url), location)
             except _httpx.HTTPError as e:
                 raise HTTPException(400, f"failed to fetch image url {url!r}: {e}")
             mt = (r.headers.get("content-type") or "image/png").split(";")[0].strip()
