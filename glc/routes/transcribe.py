@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 from typing import Literal
 
 from fastapi import APIRouter, Header, HTTPException
@@ -12,6 +13,7 @@ from glc.security.auth import require_install_token
 from glc.voice.stt import STTError, transcribe
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 class TranscribeRequest(BaseModel):
@@ -35,13 +37,14 @@ async def transcribe_route(req: TranscribeRequest, authorization: str | None = H
     try:
         audio = base64.b64decode(req.audio_b64)
     except Exception as e:
-        raise HTTPException(400, f"audio_b64 is not valid base64: {e}") from e
+        raise HTTPException(400, "audio_b64 is not valid base64") from e
     try:
         r = await transcribe(audio, req.mime, prefer=req.prefer)
     except STTError as e:
+        logger.exception("Transcription provider request failed")
         if req.prefer == "streaming":
-            raise HTTPException(400, str(e)) from e
-        raise HTTPException(e.status or 502, str(e)) from e
+            raise HTTPException(400, "streaming transcription request rejected") from e
+        raise HTTPException(e.status or 502, "transcription provider request failed") from e
     return TranscribeResponse(
         text=r.text,
         language=r.language,
