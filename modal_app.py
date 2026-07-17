@@ -9,6 +9,11 @@ import modal
 app = modal.App("glc-v1-gateway")
 logger = logging.getLogger(__name__)
 
+BASE_IMAGE = (
+    "python:3.11.15-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba"
+)
+UV_VERSION = "0.11.3"
+
 SUPPORTED_PROVIDER_SLOTS = ("gemini", "nvidia", "groq", "cerebras", "openrouter", "github")
 PROVIDER_SLOTS = tuple(
     name
@@ -30,19 +35,14 @@ SANDBOX_EGRESS_DOMAINS = tuple(
 TOOL_CREDENTIAL_SLOTS = frozenset(
     slot.strip().lower() for slot in os.getenv("GLC_TOOL_CREDENTIAL_SLOTS", "").split(",") if slot.strip()
 )
-sandbox_image = modal.Image.debian_slim(python_version="3.11")
+sandbox_image = modal.Image.from_registry(BASE_IMAGE)
 
 image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .pip_install(
-        "fastapi>=0.110",
-        "uvicorn[standard]>=0.27",
-        "httpx>=0.27",
-        "python-dotenv>=1.0",
-        "pydantic>=2.6",
-        "jsonschema>=4.21",
-        "pyyaml>=6.0",
-        "websockets>=12.0",
+    modal.Image.from_registry(BASE_IMAGE)
+    .uv_sync(
+        frozen=True,
+        uv_version=UV_VERSION,
+        extra_options="--no-dev",
     )
     .env(
         {
