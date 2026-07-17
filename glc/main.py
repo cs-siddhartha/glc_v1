@@ -33,6 +33,7 @@ from glc.routes import transcribe as transcribe_route  # noqa: E402
 from glc.routing import Router, RouterPool  # noqa: E402
 
 PORT = int(os.getenv("GLC_PORT", "8111"))
+IS_PRODUCTION = os.getenv("GLC_ENV", "development").lower() == "production"
 
 
 def _install_sighup_reload() -> None:
@@ -73,7 +74,13 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="GLC v1 — Gateway for LLMs and Channels", lifespan=lifespan)
+app = FastAPI(
+    title="GLC v1 — Gateway for LLMs and Channels",
+    lifespan=lifespan,
+    docs_url=None if IS_PRODUCTION else "/docs",
+    redoc_url=None if IS_PRODUCTION else "/redoc",
+    openapi_url=None if IS_PRODUCTION else "/openapi.json",
+)
 
 app.include_router(chat_route.router)
 app.include_router(transcribe_route.router)
@@ -84,11 +91,12 @@ app.include_router(channels_route.router)
 
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
+    docs_hint = "" if IS_PRODUCTION else "<p>Open <code>/docs</code> for the OpenAPI explorer.</p>"
     return (
         "<html><body style='font-family:sans-serif;max-width:680px;margin:2em auto'>"
         "<h1>GLC v1</h1>"
         "<p>Gateway for LLMs and Channels — Session 11 scaffold.</p>"
-        "<p>Open <code>/docs</code> for the OpenAPI explorer.</p>"
+        f"{docs_hint}"
         "<p>Channel adapters connect over <code>WS /v1/channels/&lt;name&gt;</code>."
         " V9 callers should point at this port unchanged: chat, vision, embed,"
         " batch, cost-by-agent, providers, capabilities, status, calls."
