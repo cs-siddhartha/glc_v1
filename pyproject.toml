@@ -12,6 +12,7 @@ dependencies = [
     "jsonschema>=4.21",
     "pyyaml>=6.0",
     "websockets>=12.0",
+    "modal>=1.5.2",
 ]
 
 [dependency-groups]
