@@ -14,6 +14,7 @@ config and logs a warning so the gateway boots in a known-safe state.
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
 import threading
 from pathlib import Path
@@ -166,4 +167,9 @@ def reload_engine() -> None:
 
 
 def evaluate(tool_call: dict[str, Any], context: dict[str, Any]) -> PolicyVerdict:
+    """Evaluate remotely in production so caller-process monkey patches cannot alter policy."""
+    if os.getenv("GLC_MODAL_POLICY_MODE") == "1":
+        from glc.modal_policy import evaluate_policy
+
+        return evaluate_policy(tool_call, context)
     return get_engine().evaluate(tool_call, context)

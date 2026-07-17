@@ -54,12 +54,16 @@ image = (
             "GLC_MODAL_PROVIDER_MODE": "1",
             "GLC_MODAL_PROVIDER_APP": "glc-v1-gateway",
             "GLC_MODAL_PROVIDER_SLOTS": ",".join(PROVIDER_SLOTS),
+            "GLC_MODAL_POLICY_MODE": "1",
+            "GLC_MODAL_POLICY_APP": "glc-v1-gateway",
         }
     )
     .add_local_dir(str(Path(__file__).parent / "glc"), remote_path="/root/glc")
 )
 
 data_volume = modal.Volume.from_name("glc-data", create_if_missing=True)
+policy_volume = modal.Volume.from_name("glc-policy", create_if_missing=True)
+policy_image = image.env({"GLC_CONFIG_DIR": "/policy"})
 
 
 class _CommittingASGIApp:
@@ -92,6 +96,17 @@ class _CommittingASGIApp:
             await send(message)
 
         await self._web(scope, receive, send_after_commit)
+
+
+@app.function(image=policy_image, volumes={"/policy": policy_volume})
+def policy_evaluator(tool_call: dict, context: dict) -> dict:
+    """Evaluate policy in a secretless process that is isolated from caller monkey patches."""
+    from glc.config import policy_yaml_path
+    from glc.policy.engine import PolicyEngine
+
+    policy_volume.reload()
+    engine = PolicyEngine.from_yaml(policy_yaml_path())
+    return engine.evaluate(tool_call, context).model_dump()
 
 
 async def _execute_provider_slot(slot: str, payload: dict) -> dict:
