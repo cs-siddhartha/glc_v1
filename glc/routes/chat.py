@@ -346,7 +346,8 @@ def _validate_structured(text: str, schema: dict):
 
 
 @router.post("/v1/chat")
-async def chat(req: ChatRequest, request: Request):
+async def chat(req: ChatRequest, request: Request, authorization: str | None = Header(default=None)):
+    require_install_token(authorization)
     state = request.app.state
     rtr = state.router
     router_pool = state.router_pool
@@ -639,13 +640,16 @@ async def chat(req: ChatRequest, request: Request):
 
 
 @router.post("/v1/chat/batch")
-async def chat_batch(req: BatchChatRequest, request: Request):
+async def chat_batch(
+    req: BatchChatRequest, request: Request, authorization: str | None = Header(default=None)
+):
+    require_install_token(authorization)
     sem = _asyncio.Semaphore(max(1, req.max_concurrency))
 
     async def _one(call: ChatRequest):
         async with sem:
             try:
-                return await chat(call, request)
+                return await chat(call, request, authorization)
             except HTTPException as he:
                 return {"error": str(he.detail), "status_code": he.status_code}
             except Exception as e:
@@ -656,7 +660,8 @@ async def chat_batch(req: BatchChatRequest, request: Request):
 
 
 @router.post("/v1/vision")
-async def vision(req: VisionRequest, request: Request):
+async def vision(req: VisionRequest, request: Request, authorization: str | None = Header(default=None)):
+    require_install_token(authorization)
     content: list[dict[str, Any]] = [{"type": "text", "text": req.prompt}]
     content.append({"type": "image_url", "image_url": {"url": req.image}})
     inner = ChatRequest(
@@ -674,11 +679,12 @@ async def vision(req: VisionRequest, request: Request):
         agent=req.agent,
         session=req.session,
     )
-    return await chat(inner, request)
+    return await chat(inner, request, authorization)
 
 
 @router.post("/v1/embed")
-async def embed(req: EmbedRequest, request: Request):
+async def embed(req: EmbedRequest, request: Request, authorization: str | None = Header(default=None)):
+    require_install_token(authorization)
     from glc import embedders as E
 
     state = request.app.state
