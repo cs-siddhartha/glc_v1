@@ -235,13 +235,15 @@ def run_untrusted_component(
 @app.function(
     image=image,
     volumes={"/data": data_volume},
+    secrets=[modal.Secret.from_name("glc-gateway-auth")],
     min_containers=0,
     max_containers=1,
 )
 @modal.asgi_app(requires_proxy_auth=True)
 def fastapi_app():
-    """Expose one durable SQLite writer while preserving the app's routes and lifespan."""
+    """Expose the durable gateway while keeping its auth secret out of persisted storage."""
     os.makedirs("/data/glc", exist_ok=True)
+    Path("/data/glc/install_token").unlink(missing_ok=True)
 
     from glc.main import app as web
 
