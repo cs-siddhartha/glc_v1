@@ -62,6 +62,38 @@ image = (
 data_volume = modal.Volume.from_name("glc-data", create_if_missing=True)
 
 
+class _CommittingASGIApp:
+    """Persist SQLite changes before externally visible ASGI work completes.
+
+    Modal Volumes periodically snapshot changes, but explicit commits keep the
+    audit trail durable at request, WebSocket-message, and shutdown boundaries.
+    """
+
+    def __init__(self, web, volume):
+        self._web = web
+        self._volume = volume
+
+    async def __call__(self, scope, receive, send):
+        """Delegate to FastAPI while committing the mounted volume before completion."""
+
+        async def send_after_commit(message):
+            """Commit writes before a response or lifecycle boundary becomes observable."""
+            message_type = message["type"]
+            should_commit = (
+                (message_type == "http.response.body" and not message.get("more_body", False))
+                or message_type in {
+                    "websocket.send",
+                    "websocket.close",
+                    "lifespan.shutdown.complete",
+                }
+            )
+            if should_commit:
+                await self._volume.commit.aio()
+            await send(message)
+
+        await self._web(scope, receive, send_after_commit)
+
+
 async def _execute_provider_slot(slot: str, payload: dict) -> dict:
     """Run one provider operation inside the only function allowed to hold that slot's key."""
     from glc.cache import GeminiCache
@@ -204,12 +236,13 @@ def run_untrusted_component(
     image=image,
     volumes={"/data": data_volume},
     min_containers=0,
+    max_containers=1,
 )
 @modal.asgi_app(requires_proxy_auth=True)
 def fastapi_app():
-    """Expose the existing app while keeping its routes and lifespan unchanged."""
+    """Expose one durable SQLite writer while preserving the app's routes and lifespan."""
     os.makedirs("/data/glc", exist_ok=True)
 
     from glc.main import app as web
 
-    return web
+    return _CommittingASGIApp(web, data_volume)
