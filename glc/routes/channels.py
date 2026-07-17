@@ -62,8 +62,19 @@ async def channel_ws(websocket: WebSocket, name: str, token: str | None = Query(
                 await websocket.send_text(json.dumps({"error": f"invalid envelope: {e}"}))
                 continue
 
+            if env.channel != name:
+                audit_append(
+                    channel=name,
+                    channel_user_id=env.channel_user_id,
+                    trust_level=env.trust_level,
+                    event_type="cross_channel_spoof",
+                    result={"declared_channel": env.channel},
+                )
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+
             ok, why = allowed(
-                env.channel,
+                name,
                 env.channel_user_id,
                 owner_ids=owners,
                 is_public_channel=bool(env.metadata.get("is_public_channel", False)),
@@ -71,7 +82,7 @@ async def channel_ws(websocket: WebSocket, name: str, token: str | None = Query(
             )
             if not ok:
                 audit_append(
-                    channel=env.channel,
+                    channel=name,
                     channel_user_id=env.channel_user_id,
                     trust_level=env.trust_level,
                     event_type="allowlist_drop",
@@ -80,10 +91,10 @@ async def channel_ws(websocket: WebSocket, name: str, token: str | None = Query(
                 await websocket.send_text(json.dumps({"error": f"dropped: {why}"}))
                 continue
 
-            ok, why = limiter.check_message(env.channel, env.channel_user_id)
+            ok, why = limiter.check_message(name, env.channel_user_id)
             if not ok:
                 audit_append(
-                    channel=env.channel,
+                    channel=name,
                     channel_user_id=env.channel_user_id,
                     trust_level=env.trust_level,
                     event_type="rate_limit",
@@ -93,7 +104,7 @@ async def channel_ws(websocket: WebSocket, name: str, token: str | None = Query(
                 continue
 
             audit_append(
-                channel=env.channel,
+                channel=name,
                 channel_user_id=env.channel_user_id,
                 trust_level=env.trust_level,
                 event_type="inbound_message",
@@ -104,7 +115,7 @@ async def channel_ws(websocket: WebSocket, name: str, token: str | None = Query(
             # verify the wire end-to-end. The real agent runtime hooks
             # in here in subsequent sessions.
             reply = ChannelReply(
-                channel=env.channel,
+                channel=name,
                 channel_user_id=env.channel_user_id,
                 text=f"[glc echo] {env.text or ''}",
                 thread_id=env.thread_id,

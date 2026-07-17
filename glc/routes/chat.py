@@ -11,14 +11,18 @@ regress them — tests in test_v9_compat.py assert behaviour shape.
 from __future__ import annotations
 
 import asyncio as _asyncio
+import ipaddress
 import json
+import logging
 import os
+import socket
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 
 import yaml
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from jsonschema import Draft202012Validator, ValidationError
 
@@ -36,6 +40,7 @@ from glc.llm_schemas import (
     VisionRequest,
 )
 from glc.routing import DEFAULT_ROUTER_ORDER, LIMITS, SHORTCUTS
+from glc.security.auth import require_install_token
 
 DEFAULT_ORDER = ["ollama", "gemini", "nvidia", "groq", "cerebras", "openrouter", "github"]
 ORDER = [x.strip() for x in os.getenv("LLM_ORDER", ",".join(DEFAULT_ORDER)).split(",") if x.strip()]
@@ -70,6 +75,9 @@ ROUTER_PROMPT = (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+UPSTREAM_ERROR = "upstream provider request failed"
 
 
 # ─────────────────────────── helpers (verbatim port) ──────────────────────────
@@ -290,17 +298,75 @@ async def _resolve_image_urls(messages):
 
     import httpx as _httpx
 
+    def _host_is_allowlisted(host: str) -> bool:
+        """Match image destinations against explicit exact-host or wildcard entries."""
+        entries = {
+            entry.strip().lower().rstrip(".")
+            for entry in os.getenv("GLC_IMAGE_URL_ALLOWLIST", "").split(",")
+            if entry.strip()
+        }
+        return host in entries or any(
+            entry.startswith("*.") and host.endswith(entry[1:]) and host != entry[2:] for entry in entries
+        )
+
+    async def _validate_destination(url: str) -> None:
+        """Reject non-allowlisted or non-public destinations before each outbound request."""
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError as e:
+            raise HTTPException(400, f"invalid image URL: {e}") from e
+
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise HTTPException(400, "image URL must use http or https")
+        if parsed.username is not None or parsed.password is not None:
+            raise HTTPException(400, "image URL credentials are not allowed")
+        if port not in (80, 443):
+            raise HTTPException(400, "image URL must use port 80 or 443")
+
+        try:
+            host = parsed.hostname.encode("idna").decode("ascii").lower().rstrip(".")
+        except UnicodeError as e:
+            raise HTTPException(400, "image URL hostname is invalid") from e
+        if not _host_is_allowlisted(host):
+            raise HTTPException(400, f"image URL host {host!r} is not allowlisted")
+
+        try:
+            addresses = await _asyncio.get_running_loop().getaddrinfo(
+                host,
+                port,
+                type=socket.SOCK_STREAM,
+            )
+        except socket.gaierror as e:
+            raise HTTPException(400, f"image URL host {host!r} could not be resolved") from e
+
+        resolved_ips = {ipaddress.ip_address(item[4][0].split("%", 1)[0]) for item in addresses}
+        if not resolved_ips or any(not address.is_global for address in resolved_ips):
+            raise HTTPException(400, f"image URL host {host!r} resolves to a non-public address")
+
     async def _fetch_to_data_url(url: str) -> str:
         headers = {
             "User-Agent": "Mozilla/5.0 (compatible; GLCv1/0.1; +image-resolver)",
             "Accept": "image/*,*/*;q=0.8",
         }
-        async with _httpx.AsyncClient(timeout=30, follow_redirects=True, headers=headers) as c:
+        async with _httpx.AsyncClient(timeout=30, follow_redirects=False, headers=headers) as c:
             try:
-                r = await c.get(url)
-                r.raise_for_status()
+                current_url = url
+                for redirect_count in range(6):
+                    await _validate_destination(current_url)
+                    r = await c.get(current_url)
+                    if r.status_code not in (301, 302, 303, 307, 308):
+                        r.raise_for_status()
+                        break
+                    location = r.headers.get("location")
+                    if not location:
+                        raise HTTPException(400, "image URL redirect is missing a destination")
+                    if redirect_count == 5:
+                        raise HTTPException(400, "image URL exceeded the redirect limit")
+                    current_url = urljoin(str(r.url), location)
             except _httpx.HTTPError as e:
-                raise HTTPException(400, f"failed to fetch image url {url!r}: {e}")
+                logger.warning("Image fetch failed for %r: %s", url, e)
+                raise HTTPException(400, "failed to fetch image URL") from e
             mt = (r.headers.get("content-type") or "image/png").split(";")[0].strip()
             b64 = base64.b64encode(r.content).decode()
             return f"data:{mt};base64,{b64}"
@@ -345,7 +411,8 @@ def _validate_structured(text: str, schema: dict):
 
 
 @router.post("/v1/chat")
-async def chat(req: ChatRequest, request: Request):
+async def chat(req: ChatRequest, request: Request, authorization: str | None = Header(default=None)):
+    require_install_token(authorization)
     state = request.app.state
     rtr = state.router
     router_pool = state.router_pool
@@ -397,7 +464,6 @@ async def chat(req: ChatRequest, request: Request):
         )
 
     all_attempts: list[dict] = []
-    last_err = None
 
     if explicit_override and len(candidates) == 1:
         deadline = time.time() + 30
@@ -471,7 +537,7 @@ async def chat(req: ChatRequest, request: Request):
                             session=req.session,
                             retries=retries,
                         )
-                        yield f"data: {json.dumps({'error': str(e)[:300]})}\n\n"
+                        yield f"data: {json.dumps({'error': UPSTREAM_ERROR})}\n\n"
 
                 return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -534,7 +600,8 @@ async def chat(req: ChatRequest, request: Request):
                     try:
                         parsed = _validate_structured(result["text"], req.response_format.schema_)
                     except (ValueError, ValidationError) as ve2:
-                        raise HTTPException(503, f"structured output failed validation: {ve2}")
+                        logger.warning("Upstream structured output failed validation: %s", ve2)
+                        raise HTTPException(503, "upstream provider returned invalid structured output")
 
             tokens = (result["input_tokens"] or 0) + (result["output_tokens"] or 0)
             rtr.state[name].tokens_today += tokens
@@ -583,7 +650,6 @@ async def chat(req: ChatRequest, request: Request):
                 retries=retries,
             ).model_dump()
         except P.ProviderError as e:
-            last_err = str(e)
             secs, reason = _backoff_for(e, has_model_override=bool(req.model))
             if secs > 0:
                 rtr.state[name].mark_unavailable(secs, reason)
@@ -600,18 +666,17 @@ async def chat(req: ChatRequest, request: Request):
                 session=req.session,
                 retries=retries,
             )
-            tag = f"failed: {str(e)[:100]}"
+            tag = "upstream request failed"
             if secs > 0:
                 tag += f" → backoff {secs:.0f}s ({reason})"
             all_attempts.append({"provider": name, "reason": tag})
             if explicit_override or not getattr(e, "retryable", True):
-                raise HTTPException(502, f"{name} failed: {e}")
+                raise HTTPException(502, UPSTREAM_ERROR)
             candidates = [c for c in candidates if c != name]
             continue
         except HTTPException:
             raise
         except Exception as e:
-            last_err = str(e)
             secs, reason = _backoff_for(e, has_model_override=bool(req.model))
             if secs > 0:
                 rtr.state[name].mark_unavailable(secs, reason)
@@ -628,34 +693,39 @@ async def chat(req: ChatRequest, request: Request):
                 session=req.session,
                 retries=retries,
             )
-            all_attempts.append({"provider": name, "reason": f"exception: {str(e)[:120]}"})
+            all_attempts.append({"provider": name, "reason": "upstream request failed"})
             if explicit_override:
-                raise HTTPException(502, f"{name} failed: {e}")
+                raise HTTPException(502, UPSTREAM_ERROR)
             candidates = [c for c in candidates if c != name]
             continue
 
-    raise HTTPException(503, f"all providers unavailable. attempts: {all_attempts}. last_error: {last_err}")
+    raise HTTPException(503, "upstream service unavailable")
 
 
 @router.post("/v1/chat/batch")
-async def chat_batch(req: BatchChatRequest, request: Request):
+async def chat_batch(
+    req: BatchChatRequest, request: Request, authorization: str | None = Header(default=None)
+):
+    require_install_token(authorization)
     sem = _asyncio.Semaphore(max(1, req.max_concurrency))
 
     async def _one(call: ChatRequest):
         async with sem:
             try:
-                return await chat(call, request)
+                return await chat(call, request, authorization)
             except HTTPException as he:
                 return {"error": str(he.detail), "status_code": he.status_code}
-            except Exception as e:
-                return {"error": str(e)[:400], "status_code": 500}
+            except Exception:
+                logger.exception("Unexpected batch chat failure")
+                return {"error": UPSTREAM_ERROR, "status_code": 500}
 
     results = await _asyncio.gather(*[_one(c) for c in req.calls])
     return {"results": results}
 
 
 @router.post("/v1/vision")
-async def vision(req: VisionRequest, request: Request):
+async def vision(req: VisionRequest, request: Request, authorization: str | None = Header(default=None)):
+    require_install_token(authorization)
     content: list[dict[str, Any]] = [{"type": "text", "text": req.prompt}]
     content.append({"type": "image_url", "image_url": {"url": req.image}})
     inner = ChatRequest(
@@ -673,11 +743,12 @@ async def vision(req: VisionRequest, request: Request):
         agent=req.agent,
         session=req.session,
     )
-    return await chat(inner, request)
+    return await chat(inner, request, authorization)
 
 
 @router.post("/v1/embed")
-async def embed(req: EmbedRequest, request: Request):
+async def embed(req: EmbedRequest, request: Request, authorization: str | None = Header(default=None)):
+    require_install_token(authorization)
     from glc import embedders as E
 
     state = request.app.state
@@ -712,11 +783,11 @@ async def embed(req: EmbedRequest, request: Request):
         )
         if req.provider:
             if e.status == 429:
-                raise HTTPException(429, f"{req.provider} rate-limited: {e}")
+                raise HTTPException(429, "embedding request rate limited")
             if e.status == 400:
-                raise HTTPException(400, str(e))
-            raise HTTPException(502, f"{req.provider} embed failed: {e}")
-        raise HTTPException(503, str(e))
+                raise HTTPException(400, "embedding request rejected")
+            raise HTTPException(502, "embedding provider request failed")
+        raise HTTPException(503, "embedding service unavailable")
 
     db.log_call(
         provider=name,
@@ -740,7 +811,8 @@ async def embed(req: EmbedRequest, request: Request):
 
 
 @router.get("/v1/embedders")
-async def list_embedders(request: Request):
+async def list_embedders(request: Request, authorization: str | None = Header(default=None)):
+    require_install_token(authorization)
     from glc import embedders as E
 
     state = request.app.state
@@ -756,10 +828,15 @@ async def list_embedders(request: Request):
 
 
 @router.get("/v1/cost/by_agent")
-async def cost_by_agent(session: str | None = None, agent: str | None = None):
+async def cost_by_agent(
+    session: str | None = None,
+    agent: str | None = None,
+    authorization: str | None = Header(default=None),
+):
+    tenant = require_install_token(authorization)
     from glc import pricing as _pricing
 
-    raw = db.by_agent(session=session)
+    raw = db.by_agent(session=session, tenant=tenant)
     if agent:
         raw = {agent: raw.get(agent, [])}
     out: dict[str, list[dict]] = {}
@@ -773,7 +850,8 @@ async def cost_by_agent(session: str | None = None, agent: str | None = None):
 
 
 @router.get("/v1/providers")
-async def list_providers(request: Request):
+async def list_providers(request: Request, authorization: str | None = Header(default=None)):
+    require_install_token(authorization)
     r = request.app.state.router
     return {
         "order": r.order,
@@ -785,7 +863,8 @@ async def list_providers(request: Request):
 
 
 @router.get("/v1/capabilities")
-async def capabilities(request: Request):
+async def capabilities(request: Request, authorization: str | None = Header(default=None)):
+    require_install_token(authorization)
     r = request.app.state.router
     out = {}
     for name, p in r.providers.items():
@@ -804,7 +883,8 @@ async def capabilities(request: Request):
 
 
 @router.get("/v1/status")
-async def status(request: Request):
+async def status(request: Request, authorization: str | None = Header(default=None)):
+    require_install_token(authorization)
     r = request.app.state.router
     return {
         "order": r.order,
@@ -815,7 +895,8 @@ async def status(request: Request):
 
 
 @router.get("/v1/routers")
-async def routers(request: Request):
+async def routers(request: Request, authorization: str | None = Header(default=None)):
+    require_install_token(authorization)
     rp = request.app.state.router_pool
     return {
         "order": rp.order,
@@ -829,5 +910,11 @@ async def routers(request: Request):
 
 
 @router.get("/v1/calls")
-async def calls(limit: int = 100, provider: str | None = None, status: str | None = None):
-    return db.recent(limit=limit, provider=provider, status=status)
+async def calls(
+    limit: int = 100,
+    provider: str | None = None,
+    status: str | None = None,
+    authorization: str | None = Header(default=None),
+):
+    tenant = require_install_token(authorization)
+    return db.recent(limit=limit, provider=provider, status=status, tenant=tenant)

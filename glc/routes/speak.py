@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
+from glc.security.auth import require_install_token
 from glc.voice.tts import TTSError, synthesize
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 class SpeakRequest(BaseModel):
@@ -28,11 +31,13 @@ class SpeakResponse(BaseModel):
 
 
 @router.post("/v1/speak", response_model=SpeakResponse)
-async def speak_route(req: SpeakRequest):
+async def speak_route(req: SpeakRequest, authorization: str | None = Header(default=None)):
+    require_install_token(authorization)
     try:
         r = await synthesize(req.text, voice_id=req.voice_id, prefer=req.prefer)
     except TTSError as e:
-        raise HTTPException(e.status or 502, str(e)) from e
+        logger.exception("Speech provider request failed")
+        raise HTTPException(e.status or 502, "speech provider request failed") from e
     return SpeakResponse(
         audio_b64=r.audio_b64,
         mime=r.mime,

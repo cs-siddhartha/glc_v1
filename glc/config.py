@@ -6,6 +6,7 @@ tests and CI. The directory is created on import if missing.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 
@@ -42,8 +43,16 @@ def install_token_path() -> Path:
 
 
 def get_or_create_install_token() -> str:
-    """Per-installation token used to authenticate WS adapter connections
-    and /v1/control/* requests. Generated once and persisted to disk."""
+    """Load production auth from the process Secret, with a local file fallback for development."""
+    configured_token = os.getenv("GLC_INSTALL_TOKEN")
+    if configured_token is not None:
+        configured_token = configured_token.strip()
+        if not configured_token:
+            raise RuntimeError("GLC_INSTALL_TOKEN must not be empty")
+        return configured_token
+    if os.getenv("GLC_ENV", "development").lower() == "production":
+        raise RuntimeError("GLC_INSTALL_TOKEN is required in production")
+
     p = install_token_path()
     if p.exists():
         return p.read_text().strip()
@@ -56,3 +65,9 @@ def get_or_create_install_token() -> str:
     except OSError:
         pass
     return tok
+
+
+def install_tenant_id() -> str:
+    """Derive a stable tenant scope without storing or exposing the installation token itself."""
+    token = get_or_create_install_token()
+    return hashlib.sha256(token.encode()).hexdigest()
