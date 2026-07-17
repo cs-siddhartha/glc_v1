@@ -194,6 +194,11 @@ def build_embedders() -> tuple[list[EmbeddingProvider], list[str]]:
     prerequisites are satisfied (Ollama URL reachable in principle is not
     checked here; an unset GEMINI_API_KEY drops the fallback).
     """
+    if os.getenv("GLC_MODAL_PROVIDER_MODE") == "1":
+        from glc.modal_providers import build_modal_embedders
+
+        return build_modal_embedders()
+
     ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
     ollama_model = os.getenv("EMBED_OLLAMA_MODEL", "nomic-embed-text")
 

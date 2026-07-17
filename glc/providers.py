@@ -1162,6 +1162,11 @@ def build_providers(cache_store):
     - cerebras worker default: zai-glm-4.7 (was qwen-3-235b-a22b-instruct-2507, deprecating May 27 2026)
     - groq worker default: openai/gpt-oss-120b (was llama-3.3-70b-versatile, now moved to router pool)
     """
+    if os.getenv("GLC_MODAL_PROVIDER_MODE") == "1":
+        from glc.modal_providers import build_modal_providers
+
+        return build_modal_providers()
+
     out = {}
     if k := os.getenv("GEMINI_API_KEY"):
         out["gemini"] = GeminiProvider(k, os.getenv("GEMINI_MODEL", "gemini-2.5-flash"), cache_store)
@@ -1210,6 +1215,11 @@ def build_router_providers():
     as workers; per-provider rate budgets are independent because the providers
     we picked (Cerebras, Groq, NVIDIA, GitHub) all meter per-model, not per-key.
     """
+    if os.getenv("GLC_MODAL_PROVIDER_MODE") == "1":
+        from glc.modal_providers import build_modal_providers
+
+        return build_modal_providers(router=True)
+
     out = {}
     if k := os.getenv("CEREBRAS_API_KEY"):
         out["cerebras"] = CerebrasProvider(k, os.getenv("ROUTER_CEREBRAS_MODEL", ROUTER_DEFAULTS["cerebras"]))
