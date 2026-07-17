@@ -35,7 +35,11 @@ SANDBOX_EGRESS_DOMAINS = tuple(
 TOOL_CREDENTIAL_SLOTS = frozenset(
     slot.strip().lower() for slot in os.getenv("GLC_TOOL_CREDENTIAL_SLOTS", "").split(",") if slot.strip()
 )
-sandbox_image = modal.Image.from_registry(BASE_IMAGE)
+sandbox_image = modal.Image.from_registry(BASE_IMAGE).add_local_file(
+    Path(__file__).parent / "glc" / "sandbox_entrypoint.py",
+    "/sandbox_entrypoint.py",
+    copy=True,
+)
 
 image = (
     modal.Image.from_registry(BASE_IMAGE)
@@ -223,16 +227,25 @@ def run_untrusted_component(
         raise ValueError("credential slot is not approved for tool execution")
 
     sandbox_secrets = [modal.Secret.from_name(f"glc-tool-{normalized_slot}")] if normalized_slot else []
+    network_options = (
+        {"outbound_domain_allowlist": list(SANDBOX_EGRESS_DOMAINS)}
+        if SANDBOX_EGRESS_DOMAINS
+        else {"block_network": True}
+    )
 
     sandbox = modal.Sandbox.create(
+        "python",
+        "/sandbox_entrypoint.py",
         *command,
         app=app,
         image=sandbox_image,
         timeout=60,
         cpu=0.5,
         memory=512,
+        workdir="/tmp",
+        env={"HOME": "/tmp", "TMPDIR": "/tmp"},
         secrets=sandbox_secrets,
-        outbound_domain_allowlist=list(SANDBOX_EGRESS_DOMAINS),
+        **network_options,
     )
     try:
         stdout = sandbox.stdout.read()
