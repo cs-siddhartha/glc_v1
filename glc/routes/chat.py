@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from jsonschema import Draft202012Validator, ValidationError
 
@@ -36,6 +36,7 @@ from glc.llm_schemas import (
     VisionRequest,
 )
 from glc.routing import DEFAULT_ROUTER_ORDER, LIMITS, SHORTCUTS
+from glc.security.auth import require_install_token
 
 DEFAULT_ORDER = ["ollama", "gemini", "nvidia", "groq", "cerebras", "openrouter", "github"]
 ORDER = [x.strip() for x in os.getenv("LLM_ORDER", ",".join(DEFAULT_ORDER)).split(",") if x.strip()]
@@ -740,7 +741,8 @@ async def embed(req: EmbedRequest, request: Request):
 
 
 @router.get("/v1/embedders")
-async def list_embedders(request: Request):
+async def list_embedders(request: Request, authorization: str | None = Header(default=None)):
+    require_install_token(authorization)
     from glc import embedders as E
 
     state = request.app.state
@@ -773,7 +775,8 @@ async def cost_by_agent(session: str | None = None, agent: str | None = None):
 
 
 @router.get("/v1/providers")
-async def list_providers(request: Request):
+async def list_providers(request: Request, authorization: str | None = Header(default=None)):
+    require_install_token(authorization)
     r = request.app.state.router
     return {
         "order": r.order,
@@ -785,7 +788,8 @@ async def list_providers(request: Request):
 
 
 @router.get("/v1/capabilities")
-async def capabilities(request: Request):
+async def capabilities(request: Request, authorization: str | None = Header(default=None)):
+    require_install_token(authorization)
     r = request.app.state.router
     out = {}
     for name, p in r.providers.items():
@@ -804,7 +808,8 @@ async def capabilities(request: Request):
 
 
 @router.get("/v1/status")
-async def status(request: Request):
+async def status(request: Request, authorization: str | None = Header(default=None)):
+    require_install_token(authorization)
     r = request.app.state.router
     return {
         "order": r.order,
@@ -815,7 +820,8 @@ async def status(request: Request):
 
 
 @router.get("/v1/routers")
-async def routers(request: Request):
+async def routers(request: Request, authorization: str | None = Header(default=None)):
+    require_install_token(authorization)
     rp = request.app.state.router_pool
     return {
         "order": rp.order,
