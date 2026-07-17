@@ -1,5 +1,5 @@
--- glc_v1 audit log. Append-only; the application layer never issues
--- UPDATE or DELETE against this table.
+-- glc_v1 audit log. The store installs database triggers that reject UPDATE
+-- and DELETE after any required schema migration or chain backfill completes.
 
 CREATE TABLE IF NOT EXISTS audit_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -12,15 +12,18 @@ CREATE TABLE IF NOT EXISTS audit_log (
     tool            TEXT,
     policy_verdict  TEXT,
     params_json     TEXT,
-    result_json     TEXT
+    result_json     TEXT,
+    prev_hash       TEXT,
+    entry_hash      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_log(session_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_channel ON audit_log(channel, ts DESC);
 
--- Schema version table: any change to the columns above requires a
--- documented version bump. Migrations are not automatic.
+-- Schema version 2 adds the tamper-evident prev_hash/entry_hash chain and
+-- database-enforced append-only triggers. Existing databases are migrated by
+-- glc.audit.store.init_store().
 CREATE TABLE IF NOT EXISTS audit_schema (
     version INTEGER PRIMARY KEY,
     applied_at REAL NOT NULL
